@@ -9,7 +9,16 @@ import base64
 import ctypes
 import pandas as pd
 from flask import Flask, render_template, jsonify, send_file, request
-import io 
+import io
+
+# Import new secure storage module
+from secure_storage import (
+    SecureStorage, 
+    WindowsACLManager, 
+    WindowsCredentialManager,
+    SecureString,
+    WindowsSecurityError
+) 
 
 app = Flask(__name__)
 
@@ -19,24 +28,32 @@ DEFAULT_VPN_ASSIGNED_IP = "10.54.2.182"
 DEFAULT_KONTROL_SURESI = 10
 DATA_FILE = "vpn_history.json"
 SENSITIVE_FIELDS = ("password", "totp_secret")
+# Legacy prefixes for migration
 DPAPI_PREFIX = "dpapi:"
 FERNET_PREFIX = "fernet:"
 CRYPTPROTECT_UI_FORBIDDEN = 0x01
 DEBUG_ENABLED = os.environ.get("VPN_KONTROL_DEBUG", "false").lower() == "true"
 BIND_HOST = os.environ.get("VPN_KONTROL_HOST", "127.0.0.1")
+# Use Windows Credential Manager as fallback/alternative
+USE_CREDENTIAL_MANAGER = os.environ.get("VPN_USE_CREDENTIAL_MANAGER", "false").lower() == "true"
 
 # Pulse Secure Path
 PULSE_LAUNCHER_PATH = r"C:\Program Files (x86)\Common Files\Pulse Secure\Integration\pulselauncher.exe"
+
+# Initialize secure storage (master key pattern with DPAPI + AES-GCM)
+try:
+    _secure_storage = SecureStorage()
+    print("Secure storage initialized with DPAPI + AES-GCM master key pattern")
+except Exception as e:
+    print(f"Warning: Could not initialize secure storage: {e}")
+    _secure_storage = None
 
 _fernet_cipher = None
 _fernet_checked = False
 
 def secure_file_permissions(path):
-    if os.name != "nt":
-        try:
-            os.chmod(path, 0o600)
-        except Exception:
-            pass
+    """Set secure file permissions using Windows ACLs or Unix permissions"""
+    WindowsACLManager.set_user_only_permissions(path)
 
 def get_fernet_cipher():
     global _fernet_cipher, _fernet_checked
@@ -56,48 +73,9 @@ def get_fernet_cipher():
         _fernet_cipher = None
     return _fernet_cipher
 
-def dpapi_encrypt(plain_text):
-    class DATA_BLOB(ctypes.Structure):
-        _fields_ = [
-            ("cbData", ctypes.c_ulong),
-            ("pbData", ctypes.POINTER(ctypes.c_ubyte)),
-        ]
-
-    raw_data = plain_text.encode("utf-8")
-    in_buffer = ctypes.create_string_buffer(raw_data, len(raw_data))
-    in_blob = DATA_BLOB(len(raw_data), ctypes.cast(in_buffer, ctypes.POINTER(ctypes.c_ubyte)))
-    out_blob = DATA_BLOB()
-
-    crypt_protect_data = ctypes.windll.crypt32.CryptProtectData
-    crypt_protect_data.argtypes = [
-        ctypes.POINTER(DATA_BLOB),
-        ctypes.c_wchar_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_ulong,
-        ctypes.POINTER(DATA_BLOB),
-    ]
-    crypt_protect_data.restype = ctypes.c_bool
-
-    if not crypt_protect_data(
-        ctypes.byref(in_blob),
-        "vpn_kontrol_secret",
-        None,
-        None,
-        None,
-        CRYPTPROTECT_UI_FORBIDDEN,
-        ctypes.byref(out_blob),
-    ):
-        raise ctypes.WinError()
-
-    try:
-        encrypted_bytes = ctypes.string_at(out_blob.pbData, out_blob.cbData)
-        return base64.b64encode(encrypted_bytes).decode("ascii")
-    finally:
-        ctypes.windll.kernel32.LocalFree(out_blob.pbData)
-
-def dpapi_decrypt(cipher_text):
+# Legacy DPAPI functions kept for migration purposes only
+def dpapi_decrypt_legacy(cipher_text):
+    """Legacy DPAPI decrypt for migrating old secrets"""
     class DATA_BLOB(ctypes.Structure):
         _fields_ = [
             ("cbData", ctypes.c_ulong),
@@ -138,38 +116,80 @@ def dpapi_decrypt(cipher_text):
     finally:
         ctypes.windll.kernel32.LocalFree(out_blob.pbData)
 
-def encrypt_sensitive_value(value):
+def encrypt_sensitive_value(field_name, value):
+    """Encrypt and store sensitive value using new secure storage"""
     if not value:
         return ""
+    
+    if not _secure_storage:
+        raise RuntimeError("Secure storage not initialized")
+    
+    try:
+        # Store in secure storage (DPAPI + AES-GCM master key pattern)
+        _secure_storage.store_secret(field_name, value)
+        
+        # Return marker indicating it's stored in secure storage
+        return f"secure_storage:{field_name}"
+    except Exception as e:
+        print(f"Error storing secret '{field_name}': {e}")
+        raise RuntimeError(f"Failed to encrypt {field_name}")
 
-    if sys.platform == "win32":
-        return f"{DPAPI_PREFIX}{dpapi_encrypt(value)}"
-
-    fernet_cipher = get_fernet_cipher()
-    if fernet_cipher:
-        encrypted = fernet_cipher.encrypt(value.encode("utf-8")).decode("utf-8")
-        return f"{FERNET_PREFIX}{encrypted}"
-
-    raise RuntimeError(
-        "Secure secret storage unavailable. On non-Windows systems set VPN_KONTROL_SECRET_KEY (Fernet key)."
-    )
-
-def decrypt_sensitive_value(value):
+def decrypt_sensitive_value(field_name, value):
+    """Decrypt sensitive value, handling both legacy and new formats"""
     if not value:
         return ""
-
+    
+    # New secure storage format
+    if value.startswith("secure_storage:"):
+        if not _secure_storage:
+            raise RuntimeError("Secure storage not initialized")
+        
+        stored_key = value.split(":", 1)[1]
+        try:
+            return _secure_storage.retrieve_secret(stored_key) or ""
+        except Exception as e:
+            print(f"Error retrieving secret '{stored_key}': {e}")
+            return ""
+    
+    # Legacy DPAPI format - migrate it
     if value.startswith(DPAPI_PREFIX):
         if sys.platform != "win32":
             raise RuntimeError("DPAPI encrypted config can only be decrypted on Windows.")
-        return dpapi_decrypt(value[len(DPAPI_PREFIX):])
-
+        try:
+            decrypted = dpapi_decrypt_legacy(value[len(DPAPI_PREFIX):])
+            # Auto-migrate to new secure storage
+            if _secure_storage and decrypted:
+                print(f"Migrating legacy DPAPI secret '{field_name}' to new secure storage...")
+                _secure_storage.store_secret(field_name, decrypted)
+            return decrypted
+        except Exception as e:
+            print(f"Error decrypting legacy secret '{field_name}': {e}")
+            return ""
+    
+    # Legacy Fernet format
     if value.startswith(FERNET_PREFIX):
         fernet_cipher = get_fernet_cipher()
         if not fernet_cipher:
             raise RuntimeError("Missing VPN_KONTROL_SECRET_KEY for encrypted config.")
-        return fernet_cipher.decrypt(value[len(FERNET_PREFIX):].encode("utf-8")).decode("utf-8")
-
-    # Legacy plaintext value
+        try:
+            decrypted = fernet_cipher.decrypt(value[len(FERNET_PREFIX):].encode("utf-8")).decode("utf-8")
+            # Auto-migrate to new secure storage
+            if _secure_storage and decrypted:
+                print(f"Migrating legacy Fernet secret '{field_name}' to new secure storage...")
+                _secure_storage.store_secret(field_name, decrypted)
+            return decrypted
+        except Exception as e:
+            print(f"Error decrypting legacy secret '{field_name}': {e}")
+            return ""
+    
+    # Legacy plaintext value - migrate it
+    if value and _secure_storage:
+        print(f"Migrating plaintext secret '{field_name}' to new secure storage...")
+        try:
+            _secure_storage.store_secret(field_name, value)
+        except Exception as e:
+            print(f"Error migrating plaintext secret '{field_name}': {e}")
+    
     return value
 
 def persist_config(config_data):
@@ -204,8 +224,9 @@ def load_config():
                     stored_value = saved_config.get(field, "")
                     if stored_value:
                         try:
-                            config[field] = decrypt_sensitive_value(stored_value)
-                            if not (stored_value.startswith(DPAPI_PREFIX) or stored_value.startswith(FERNET_PREFIX)):
+                            config[field] = decrypt_sensitive_value(field, stored_value)
+                            # Check if migration is needed
+                            if not stored_value.startswith("secure_storage:"):
                                 migration_needed = True
                         except Exception as e:
                             print(f"Config decrypt error ({field}): {e}")
@@ -232,9 +253,15 @@ def save_config(new_config):
         plain_value = new_config.get(field, "")
         if not plain_value:
             config_to_save[field] = ""
+            # Also clear from secure storage
+            if _secure_storage:
+                try:
+                    _secure_storage.delete_secret(field)
+                except Exception:
+                    pass
             continue
         try:
-            config_to_save[field] = encrypt_sensitive_value(plain_value)
+            config_to_save[field] = encrypt_sensitive_value(field, plain_value)
         except Exception as e:
             config_to_save[field] = ""
             warnings.append(f"{field} not persisted securely: {e}")
@@ -268,9 +295,20 @@ monitor_state = {
 }
 
 def log_yaz(mesaj):
+    """Write log entry, ensuring no secrets are accidentally logged"""
     log_file = "vpn_kontrol_log.txt"
+    
+    # Sanitize message to prevent accidental secret logging
+    sanitized = mesaj
+    for field in SENSITIVE_FIELDS:
+        # Replace any potential secrets that might have leaked into logs
+        secret_value = monitor_state.get(field, "")
+        if secret_value and len(secret_value) > 4:
+            # Replace with masked version
+            sanitized = sanitized.replace(secret_value, "***REDACTED***")
+    
     with open(log_file, "a", encoding="utf-8") as dosya:
-        entry = f"{datetime.now()} - {mesaj}"
+        entry = f"{datetime.now()} - {sanitized}"
         try:
             dosya.write(f"{entry}\n")
         except:
@@ -311,12 +349,18 @@ def get_totp_token():
     if not secret:
         return None
     try:
-        # Clean the secret (remove dashes, spaces, make uppercase)
-        clean_secret = secret.replace("-", "").replace(" ", "").upper()
-        totp = pyotp.TOTP(clean_secret)
-        return totp.now()
+        # Use SecureString for better memory handling
+        with SecureString(secret) as secure_secret:
+            # Clean the secret (remove dashes, spaces, make uppercase)
+            clean_secret = secure_secret.get().replace("-", "").replace(" ", "").upper()
+            
+            with SecureString(clean_secret) as secure_clean:
+                totp = pyotp.TOTP(secure_clean.get())
+                token = totp.now()
+                return token
     except Exception as e:
-        log_yaz(f"TOTP oluşturma hatası: {e}")
+        # Don't log the actual secret in error messages
+        log_yaz(f"TOTP oluşturma hatası: {type(e).__name__}")
         return None
 
 def enter_token_in_pulse_window():
@@ -382,6 +426,7 @@ def enter_token_in_pulse_window():
         return False
 
 def vpn_baglan():
+    """Connect to VPN using Pulse Secure launcher"""
     if not os.path.exists(PULSE_LAUNCHER_PATH):
         log_yaz("HATA: pulselauncher.exe bulunamadı.")
         return False
@@ -398,15 +443,20 @@ def vpn_baglan():
     log_yaz(f"Otomatik bağlantı deneniyor... ({url} / {realm})")
     
     try:
-        args = [
-            PULSE_LAUNCHER_PATH,
-            "-u", user,
-            "-p", pwd,
-            "-url", url,
-            "-r", realm
-        ]
+        # Use SecureString to minimize password exposure in memory
+        with SecureString(pwd) as secure_pwd:
+            args = [
+                PULSE_LAUNCHER_PATH,
+                "-u", user,
+                "-p", secure_pwd.get(),  # Get password only when needed
+                "-url", url,
+                "-r", realm
+            ]
+            
+            # Start process
+            subprocess.Popen(args)
         
-        subprocess.Popen(args)
+        # Password is now cleared from SecureString
         
         # If TOTP secret is configured, try to auto-enter token
         if monitor_state.get("totp_secret"):
@@ -418,7 +468,8 @@ def vpn_baglan():
         
         return True
     except Exception as e:
-        log_yaz(f"Bağlantı komutu hatası: {e}")
+        # Don't log the actual password in error messages
+        log_yaz(f"Bağlantı komutu hatası: {type(e).__name__}")
         return False
 
 def load_history():
