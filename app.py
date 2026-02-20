@@ -408,13 +408,52 @@ def enter_token_in_pulse_window():
         # Get window handle
         hwnd = pulse_window._hWnd
         
-        # Bring window to foreground using SetForegroundWindow
-        ctypes.windll.user32.SetForegroundWindow(hwnd)
+        # Try multiple times to bring window to foreground
+        for attempt in range(3):
+            # Restore if minimized
+            if pulse_window.isMinimized:
+                pulse_window.restore()
+                t.sleep(0.3)
+            
+            # Bring window to foreground using SetForegroundWindow
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+            t.sleep(0.5)
+            
+            # Verify window is actually in focus
+            active_hwnd = ctypes.windll.user32.GetForegroundWindow()
+            if active_hwnd == hwnd:
+                log_yaz(f"Pencere aktif hale getirildi (deneme {attempt + 1})")
+                break
+            else:
+                log_yaz(f"Pencere aktif edilemedi, tekrar deneniyor... ({attempt + 1}/3)")
+                t.sleep(0.5)
+        else:
+            log_yaz("UYARI: Pencere tam olarak aktif edilemedi, yine de devam ediliyor...")
+        
+        # Additional wait to ensure window is ready
         t.sleep(0.5)
         
-        # Type the token
-        pyautogui.typewrite(token, interval=0.05)
-        t.sleep(0.3)
+        # Click in the center of the window to ensure focus on the input field
+        # This helps ensure the token field is selected
+        try:
+            center_x = pulse_window.left + pulse_window.width // 2
+            center_y = pulse_window.top + pulse_window.height // 2
+            pyautogui.click(center_x, center_y)
+            t.sleep(0.3)
+            log_yaz("Token alanı seçildi")
+        except Exception as click_error:
+            log_yaz(f"UYARI: Token alanı tıklanamadı: {click_error}")
+        
+        # Clear any existing content in the field (press Ctrl+A then Delete)
+        pyautogui.hotkey('ctrl', 'a')
+        t.sleep(0.1)
+        pyautogui.press('delete')
+        t.sleep(0.2)
+        
+        # Type the token with a longer interval for reliability
+        # Using typewrite with increased interval for more reliable input
+        pyautogui.typewrite(token, interval=0.1)
+        t.sleep(0.5)
         
         # Press Enter to submit
         pyautogui.press('enter')
