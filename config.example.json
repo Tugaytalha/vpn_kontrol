@@ -1,0 +1,11 @@
+{
+    "vpn_ip": "",
+    "check_interval": 5,
+    "vpn_url": "",
+    "username": "your_username",
+    "password": "your_password",
+    "realm": "",
+    "totp_secret": "YOUR_TOTP_SECRET_KEY",
+    "auto_connect": false,
+    "python_executable": "python"
+}

@@ -1,0 +1,5 @@
+config.json
+*.txt
+*.json
+!config.example.json
+/__pycache__
