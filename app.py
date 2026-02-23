@@ -209,7 +209,8 @@ def load_config():
         "password": "",
         "realm": "",
         "totp_secret": "",
-        "auto_connect": False
+        "auto_connect": False,
+        "max_auto_retry": 3
     }
     if os.path.exists(CONFIG_FILE):
         try:
@@ -284,6 +285,8 @@ monitor_state = {
     "realm": current_config.get("realm", ""),
     "totp_secret": current_config.get("totp_secret", ""),
     "auto_connect": current_config.get("auto_connect", False),
+    "max_auto_retry": int(current_config.get("max_auto_retry", 3)),
+    "auto_retry_count": 0,
     "status": "Unknown",
     "status_color": "gray",
     "total_connected_seconds": 0,
@@ -582,18 +585,30 @@ def monitor_loop():
             
             # Check for Auto Connect
             if monitor_state["auto_connect"]:
-                now = time.time()
-                if now - last_connection_attempt > COOLDOWN_SECONDS:
-                    log_yaz("VPN Koptu. Otomatik bağlanılıyor...")
-                    if vpn_baglan():
-                         last_connection_attempt = now
-                    else:
-                         last_connection_attempt = now + 60 # Retry sooner if launch failed
+                max_retries = monitor_state.get("max_auto_retry", 3)
+                retry_count = monitor_state.get("auto_retry_count", 0)
+                
+                # Check if max retries exceeded
+                if retry_count >= max_retries:
+                    if retry_count == max_retries:  # Log only once
+                        log_yaz(f"UYARI: Maksimum deneme sayısına ulaşıldı ({max_retries}). Otomatik bağlantı durduruluyor.")
+                        log_yaz("Yeniden denemek için manuel bağlantı yapın veya ayarları güncelleyin.")
+                        monitor_state["auto_retry_count"] = max_retries + 1  # Prevent repeated logging
                 else:
-                    # In cooldown - log remaining time
-                    remaining = int(COOLDOWN_SECONDS - (now - last_connection_attempt))
-                    if remaining % 10 == 0:  # Log every 10 seconds
-                        log_yaz(f"Bekleniyor... ({remaining}s)")
+                    now = time.time()
+                    if now - last_connection_attempt > COOLDOWN_SECONDS:
+                        log_yaz(f"VPN Koptu. Otomatik bağlanılıyor... (Deneme {retry_count + 1}/{max_retries})")
+                        if vpn_baglan():
+                            last_connection_attempt = now
+                            monitor_state["auto_retry_count"] = retry_count + 1
+                        else:
+                            last_connection_attempt = now + 60 # Retry sooner if launch failed
+                            monitor_state["auto_retry_count"] = retry_count + 1
+                    else:
+                        # In cooldown - log remaining time
+                        remaining = int(COOLDOWN_SECONDS - (now - last_connection_attempt))
+                        if remaining % 10 == 0:  # Log every 10 seconds
+                            log_yaz(f"Bekleniyor... ({remaining}s)")
             else:
                  log_yaz("Otomatik bağlantı kapalı.")
                  # Just log if not already spamming?
@@ -605,6 +620,7 @@ def monitor_loop():
             monitor_state["status"] = "VPN Bağlantısı Aktif"
             monitor_state["status_color"] = "green"
             last_connection_attempt = 0 # Reset cooldown on success
+            monitor_state["auto_retry_count"] = 0  # Reset retry counter on successful connection
             
             # Stats update
             now = datetime.now()
@@ -705,6 +721,8 @@ def api_reconnect():
     """Manually trigger VPN reconnection"""
     try:
         log_yaz("Manuel bağlantı isteği alındı...")
+        # Reset retry counter on manual connection
+        monitor_state["auto_retry_count"] = 0
         success = vpn_baglan()
         if success:
             return jsonify({"status": "success", "message": "Bağlantı başlatıldı"})
@@ -862,7 +880,9 @@ def api_settings():
             "realm": monitor_state.get("realm", ""),
             "has_password": bool(monitor_state["password"]),
             "has_totp_secret": bool(monitor_state.get("totp_secret", "")),
-            "auto_connect": monitor_state["auto_connect"]
+            "auto_connect": monitor_state["auto_connect"],
+            "max_auto_retry": monitor_state.get("max_auto_retry", 3),
+            "auto_retry_count": monitor_state.get("auto_retry_count", 0)
         })
     
     elif request.method == 'POST':
@@ -874,6 +894,12 @@ def api_settings():
             monitor_state["username"] = data.get('username', "")
             monitor_state["realm"] = data.get('realm', "")
             monitor_state["auto_connect"] = data.get('auto_connect', False)
+            monitor_state["max_auto_retry"] = int(data.get('max_auto_retry', 3))
+            
+            # Reset retry counter when settings are updated
+            if "max_auto_retry" in data:
+                monitor_state["auto_retry_count"] = 0
+                log_yaz(f"Maksimum otomatik bağlantı denemesi güncellendi: {monitor_state['max_auto_retry']}")
 
             if data.get("clear_password"):
                 monitor_state["password"] = ""
@@ -894,7 +920,8 @@ def api_settings():
                 "password": monitor_state["password"],
                 "realm": monitor_state["realm"],
                 "totp_secret": monitor_state["totp_secret"],
-                "auto_connect": monitor_state["auto_connect"]
+                "auto_connect": monitor_state["auto_connect"],
+                "max_auto_retry": monitor_state["max_auto_retry"]
             })
 
             if not save_result["success"]:
@@ -965,7 +992,8 @@ def decode_qr():
                 "password": monitor_state["password"],
                 "realm": monitor_state["realm"],
                 "totp_secret": totp_secret,
-                "auto_connect": monitor_state["auto_connect"]
+                "auto_connect": monitor_state["auto_connect"],
+                "max_auto_retry": monitor_state.get("max_auto_retry", 3)
             })
             if not save_result["success"]:
                 return jsonify({"error": "TOTP Secret güvenli olarak kaydedilemedi"}), 500
@@ -996,7 +1024,8 @@ def decode_qr():
                 "password": monitor_state["password"],
                 "realm": monitor_state["realm"],
                 "totp_secret": secret,
-                "auto_connect": monitor_state["auto_connect"]
+                "auto_connect": monitor_state["auto_connect"],
+                "max_auto_retry": monitor_state.get("max_auto_retry", 3)
             })
             if not save_result["success"]:
                 return jsonify({"error": "TOTP Secret güvenli olarak kaydedilemedi"}), 500
