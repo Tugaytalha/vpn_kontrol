@@ -323,6 +323,52 @@ def log_yaz(mesaj):
     if len(monitor_state["logs"]) > 50:
         monitor_state["logs"].pop(0)
 
+def detect_vpn_ip():
+    """Detect the actual VPN IP address from network interfaces"""
+    try:
+        if sys.platform != "win32":
+            return None
+        
+        # Use PowerShell to get network adapter information
+        # Look for adapters with Pulse, Ivanti, Juniper, or VPN-related names
+        ps_cmd = '''
+        Get-NetAdapter | Where-Object {
+            $_.Status -eq 'Up' -and (
+                $_.InterfaceDescription -like '*Pulse*' -or
+                $_.InterfaceDescription -like '*Ivanti*' -or
+                $_.InterfaceDescription -like '*Juniper*' -or
+                $_.Name -like '*VPN*' -or
+                $_.Name -like '*Pulse*'
+            )
+        } | ForEach-Object {
+            $adapter = $_
+            Get-NetIPAddress -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | 
+            Select-Object -ExpandProperty IPAddress
+        }
+        '''
+        
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            timeout=5
+        )
+        
+        if result.returncode == 0 and result.stdout:
+            ip_addresses = result.stdout.decode('utf-8').strip().split('\n')
+            # Return the first valid IP found
+            for ip in ip_addresses:
+                ip = ip.strip()
+                if ip and not ip.startswith('169.254'):  # Ignore APIPA addresses
+                    return ip
+        
+        return None
+    except Exception as e:
+        if DEBUG_ENABLED:
+            print(f"VPN IP Detection Error: {e}")
+        return None
+
 def vpn_baglanti_kontrol_et(ip):
     try:
         if sys.platform == "win32":
@@ -552,6 +598,8 @@ def monitor_loop():
     
     last_connection_attempt = 0
     COOLDOWN_SECONDS = 30 # 30 seconds cooldown between auto-reconnect attempts
+    last_ip_check = 0
+    IP_CHECK_INTERVAL = 60  # Check for IP changes every 60 seconds
     
     # Track current day to detect date changes
     current_day_str = datetime.now().strftime("%Y-%m-%d")
@@ -573,6 +621,38 @@ def monitor_loop():
             save_history()
 
         is_connected = vpn_baglanti_kontrol_et(monitor_state["vpn_ip"])
+        
+        # Periodically check if VPN IP has changed (when connected)
+        if is_connected:
+            now = time.time()
+            if now - last_ip_check > IP_CHECK_INTERVAL:
+                last_ip_check = now
+                detected_ip = detect_vpn_ip()
+                
+                if detected_ip and detected_ip != monitor_state["vpn_ip"]:
+                    old_ip = monitor_state["vpn_ip"]
+                    monitor_state["vpn_ip"] = detected_ip
+                    log_yaz(f"VPN IP değişikliği tespit edildi: {old_ip} -> {detected_ip}")
+                    
+                    # Update config file
+                    try:
+                        save_result = save_config({
+                            "vpn_ip": detected_ip,
+                            "check_interval": monitor_state["check_interval"],
+                            "vpn_url": monitor_state["vpn_url"],
+                            "username": monitor_state["username"],
+                            "password": monitor_state["password"],
+                            "realm": monitor_state["realm"],
+                            "totp_secret": monitor_state["totp_secret"],
+                            "auto_connect": monitor_state["auto_connect"],
+                            "max_auto_retry": monitor_state["max_auto_retry"]
+                        })
+                        if save_result["success"]:
+                            log_yaz("VPN IP konfigürasyonda güncellendi")
+                        else:
+                            log_yaz("UYARI: VPN IP konfigürasyona kaydedilemedi")
+                    except Exception as e:
+                        log_yaz(f"VPN IP kaydetme hatası: {e}")
         
         if not is_connected:
             monitor_state["status"] = "VPN Bağlantısı Koptu!"
@@ -729,6 +809,64 @@ def api_reconnect():
         else:
             return jsonify({"status": "error", "message": "Bağlantı başlatılamadı"}), 500
     except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/detect-ip', methods=['POST'])
+def api_detect_ip():
+    """Manually detect and update VPN IP address"""
+    try:
+        log_yaz("VPN IP algılama isteği alındı...")
+        detected_ip = detect_vpn_ip()
+        
+        if not detected_ip:
+            return jsonify({
+                "status": "error", 
+                "message": "VPN IP adresi algılanamadı. VPN bağlı olduğundan emin olun."
+            }), 404
+        
+        old_ip = monitor_state["vpn_ip"]
+        
+        if detected_ip == old_ip:
+            return jsonify({
+                "status": "success",
+                "message": f"VPN IP değişmedi: {detected_ip}",
+                "ip": detected_ip,
+                "changed": False
+            })
+        
+        # Update monitor state
+        monitor_state["vpn_ip"] = detected_ip
+        
+        # Save to config
+        save_result = save_config({
+            "vpn_ip": detected_ip,
+            "check_interval": monitor_state["check_interval"],
+            "vpn_url": monitor_state["vpn_url"],
+            "username": monitor_state["username"],
+            "password": monitor_state["password"],
+            "realm": monitor_state["realm"],
+            "totp_secret": monitor_state["totp_secret"],
+            "auto_connect": monitor_state["auto_connect"],
+            "max_auto_retry": monitor_state["max_auto_retry"]
+        })
+        
+        if save_result["success"]:
+            log_yaz(f"VPN IP güncellendi: {old_ip} -> {detected_ip}")
+            return jsonify({
+                "status": "success",
+                "message": f"VPN IP güncellendi: {old_ip} → {detected_ip}",
+                "old_ip": old_ip,
+                "new_ip": detected_ip,
+                "changed": True
+            })
+        else:
+            return jsonify({
+                "status": "error",
+                "message": "VPN IP algılandı ancak kaydedilemedi"
+            }), 500
+            
+    except Exception as e:
+        log_yaz(f"VPN IP algılama hatası: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/api/history')

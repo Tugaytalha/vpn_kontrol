@@ -841,6 +841,10 @@
                             style="background: linear-gradient(135deg, #10b981, #059669);" title="Manuel Bağlan">
                             🔄 Bağlan
                         </button>
+                        <button id="btnDetectIp" class="btn-export"
+                            style="background: linear-gradient(135deg, #3b82f6, #2563eb);" title="VPN IP'yi Algıla">
+                            🔍 IP Algıla
+                        </button>
                         <a href="/api/export" class="btn-export">
                             📥 Excel İndir
                         </a>
@@ -1331,6 +1335,38 @@
             }, 3000);
         });
 
+        // Detect IP Button
+        const btnDetectIp = document.getElementById('btnDetectIp');
+        btnDetectIp.addEventListener('click', async () => {
+            btnDetectIp.disabled = true;
+            btnDetectIp.textContent = '⏳ Algılanıyor...';
+            try {
+                const res = await fetch('/api/detect-ip', { method: 'POST' });
+                const data = await res.json();
+                if (data.status === 'success') {
+                    if (data.changed) {
+                        btnDetectIp.textContent = '✅ Güncellendi';
+                        alert(`VPN IP güncellendi!\n${data.old_ip} → ${data.new_ip}`);
+                        // Refresh settings to show new IP
+                        inputIp.value = data.new_ip;
+                    } else {
+                        btnDetectIp.textContent = '✅ Değişmedi';
+                        alert(data.message);
+                    }
+                } else {
+                    btnDetectIp.textContent = '❌ Hata';
+                    alert(data.message || 'VPN IP algılanamadı');
+                }
+            } catch (err) {
+                btnDetectIp.textContent = '❌ Hata';
+                alert('Hata: ' + err.message);
+            }
+            setTimeout(() => {
+                btnDetectIp.disabled = false;
+                btnDetectIp.textContent = '🔍 IP Algıla';
+            }, 3000);
+        });
+
         // Settings Modal Logic
         const btnSettings = document.getElementById('btnSettings');
         const modalOverlay = document.getElementById('settingsModal');
@@ -1346,6 +1382,7 @@
         const inputTotp = document.getElementById('settingTotp');
         const clearTotp = document.getElementById('clearTotp');
         const inputAuto = document.getElementById('settingAuto');
+        const inputMaxRetry = document.getElementById('settingMaxRetry');
 
         btnSettings.addEventListener('click', () => {
             // Fetch current settings
@@ -1368,6 +1405,7 @@
                         ? "Kayıtlı TOTP var (değiştirmek için yeni değer girin)"
                         : "QR kodu yükleyin veya manuel girin";
                     inputAuto.checked = data.auto_connect || false;
+                    inputMaxRetry.value = data.max_auto_retry || 3;
                     modalOverlay.classList.add('active');
                 })
                 .catch(err => console.error(err));
@@ -1398,7 +1436,8 @@
                 vpn_url: inputUrl.value,
                 username: inputUser.value,
                 realm: inputRealm.value,
-                auto_connect: inputAuto.checked
+                auto_connect: inputAuto.checked,
+                max_auto_retry: parseInt(inputMaxRetry.value) || 3
             };
 
             if (clearPassword.checked) {
