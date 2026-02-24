@@ -46,8 +46,13 @@ PULSE_LAUNCHER_PATH = r"C:\Program Files (x86)\Common Files\Pulse Secure\Integra
 try:
     _secure_storage = SecureStorage()
     print("Secure storage initialized with DPAPI + AES-GCM master key pattern")
+except ImportError as e:
+    print(f"ERROR: Secure storage requires 'cryptography' library. Please run: pip install cryptography")
+    print(f"Details: {e}")
+    _secure_storage = None
 except Exception as e:
     print(f"Warning: Could not initialize secure storage: {e}")
+    print(f"Secrets will not be persisted securely. Install dependencies: pip install -r requirements.txt")
     _secure_storage = None
 
 _fernet_cipher = None
@@ -127,7 +132,7 @@ def encrypt_sensitive_value(field_name, value):
         return ""
     
     if not _secure_storage:
-        raise RuntimeError("Secure storage not initialized")
+        raise RuntimeError("Secure storage not initialized. Install required libraries: pip install cryptography pywin32")
     
     try:
         # Store in secure storage (DPAPI + AES-GCM master key pattern)
@@ -137,7 +142,7 @@ def encrypt_sensitive_value(field_name, value):
         return f"secure_storage:{field_name}"
     except Exception as e:
         print(f"Error storing secret '{field_name}': {e}")
-        raise RuntimeError(f"Failed to encrypt {field_name}")
+        raise RuntimeError(f"Failed to encrypt {field_name}. Check if cryptography library is installed.")
 
 def decrypt_sensitive_value(field_name, value):
     """Decrypt sensitive value, handling both legacy and new formats"""
@@ -1188,7 +1193,10 @@ def decode_qr():
                 "message": f"TOTP Secret kaydedildi! Artık token otomatik girilecek."
             }
             if save_result["warnings"]:
-                response_payload["warning"] = "TOTP secret dosyaya güvenli olarak yazılamadı. Uygulama kapanınca tekrar girmeniz gerekir."
+                warning_msg = "TOTP secret dosyaya güvenli olarak yazılamadı. Uygulama kapanınca tekrar girmeniz gerekir."
+                if "cryptography" in str(save_result["warnings"]).lower():
+                    warning_msg += " Eksik kütüphane: pip install cryptography pywin32"
+                response_payload["warning"] = warning_msg
             return jsonify(response_payload)
         
         # Check if it's a standard otpauth URL
@@ -1220,7 +1228,10 @@ def decode_qr():
                 "message": "TOTP Secret kaydedildi! Artık token otomatik girilecek."
             }
             if save_result["warnings"]:
-                response_payload["warning"] = "TOTP secret dosyaya güvenli olarak yazılamadı. Uygulama kapanınca tekrar girmeniz gerekir."
+                warning_msg = "TOTP secret dosyaya güvenli olarak yazılamadı. Uygulama kapanınca tekrar girmeniz gerekir."
+                if "cryptography" in str(save_result["warnings"]).lower():
+                    warning_msg += " Eksik kütüphane: pip install cryptography pywin32"
+                response_payload["warning"] = warning_msg
             return jsonify(response_payload)
         
         else:
