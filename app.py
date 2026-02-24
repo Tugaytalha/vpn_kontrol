@@ -919,6 +919,72 @@ def api_detect_ip():
         log_yaz(f"VPN IP algılama hatası: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
+@app.route('/api/check_dependencies')
+def api_check_dependencies():
+    """Check if all required dependencies are installed"""
+    missing_deps = []
+    warnings = []
+    
+    # Check critical dependencies
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError:
+        missing_deps.append({
+            "name": "cryptography",
+            "install": "pip install cryptography>=41.0.0",
+            "severity": "critical",
+            "message": "Secure storage will NOT work without this library. Credentials cannot be saved."
+        })
+    
+    try:
+        import pyotp
+    except ImportError:
+        missing_deps.append({
+            "name": "pyotp",
+            "install": "pip install pyotp>=2.9.0",
+            "severity": "critical",
+            "message": "TOTP token generation will not work."
+        })
+    
+    # Check recommended dependencies
+    if sys.platform == "win32":
+        try:
+            import win32security
+        except ImportError:
+            warnings.append({
+                "name": "pywin32",
+                "install": "pip install pywin32>=306",
+                "severity": "warning",
+                "message": "Windows ACLs and Credential Manager features will be limited."
+            })
+    
+    try:
+        import pyautogui
+    except ImportError:
+        warnings.append({
+            "name": "pyautogui",
+            "install": "pip install pyautogui>=0.9.54",
+            "severity": "warning",
+            "message": "Auto-token entry will not work."
+        })
+    
+    # Check if secure storage is initialized
+    if not _secure_storage:
+        if not any(d["name"] == "cryptography" for d in missing_deps):
+            warnings.append({
+                "name": "secure_storage",
+                "install": "Check LOCALAPPDATA environment variable",
+                "severity": "warning",
+                "message": "Secure storage is not initialized. Credentials may not persist."
+            })
+    
+    return jsonify({
+        "status": "ok" if not missing_deps else "error",
+        "missing": missing_deps,
+        "warnings": warnings,
+        "has_critical_issues": len(missing_deps) > 0
+    })
+
 @app.route('/api/history')
 def api_history():
     history_data = []
