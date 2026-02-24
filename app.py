@@ -7,7 +7,6 @@ import os
 import sys
 import base64
 import ctypes
-import pandas as pd
 from flask import Flask, render_template, jsonify, send_file, request
 import io
 import signal
@@ -1083,6 +1082,7 @@ def api_history_detail(date_str):
 @app.route('/api/export')
 def api_export():
     try:
+        import pandas as pd
         data = read_json_safe()
         if not data:
              return jsonify({"error": "No data found"}), 404
