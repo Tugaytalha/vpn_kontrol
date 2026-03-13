@@ -401,6 +401,22 @@ import pyotp
 import pyautogui
 import pygetwindow as gw
 
+def get_vpn_windows():
+    """Get list of currently open VPN client windows"""
+    vpn_titles = ["Ivanti Secure Access Client", "Pulse Secure", "Connect to:", "Secondary"]
+    found = []
+    for title in vpn_titles:
+        try:
+            windows = gw.getWindowsWithTitle(title)
+            found.extend(windows)
+        except Exception:
+            pass
+    return found
+
+def is_vpn_window_open():
+    """Check if any VPN client window is currently open"""
+    return len(get_vpn_windows()) > 0
+
 def get_totp_token():
     """Generate current TOTP token from secret"""
     secret = monitor_state.get("totp_secret", "")
@@ -421,9 +437,18 @@ def get_totp_token():
         log_yaz(f"TOTP oluşturma hatası: {type(e).__name__}")
         return None
 
-def enter_token_in_pulse_window():
-    """Find Pulse Secure token window and enter TOTP"""
+def enter_token_in_pulse_window(pre_existing_hwnds=None):
+    """Find Pulse Secure token window and enter TOTP.
+    
+    Args:
+        pre_existing_hwnds: Set of window handles that existed before vpn_baglan was called.
+                           Only windows NOT in this set will be interacted with, to avoid
+                           interfering with windows the user opened manually.
+    """
     import time as t
+    
+    if pre_existing_hwnds is None:
+        pre_existing_hwnds = set()
     
     token = get_totp_token()
     if not token:
@@ -432,7 +457,7 @@ def enter_token_in_pulse_window():
     
     log_yaz("TOTP token üretildi.")
     
-    # Wait for the Pulse window to appear
+    # Wait for a NEW Pulse window to appear (not one that was already open)
     max_wait = 30  # seconds
     pulse_window = None
     
@@ -441,20 +466,24 @@ def enter_token_in_pulse_window():
         if i % 5 == 0:
             log_yaz(f"Token penceresi araniyor... ({i}/{max_wait}s)")
         # Look for Pulse Secure windows
-        windows = gw.getWindowsWithTitle("Ivanti Secure Access Client")
-        if not windows:
-            windows = gw.getWindowsWithTitle("Pulse Secure")
-        if not windows:
-            windows = gw.getWindowsWithTitle("Connect to:")
-        if not windows:
-            windows = gw.getWindowsWithTitle("Secondary")
+        all_windows = get_vpn_windows()
         
-        if windows:
-            pulse_window = windows[0]
+        # Filter out windows that existed before we launched pulselauncher
+        new_windows = [w for w in all_windows if w._hWnd not in pre_existing_hwnds]
+        
+        if new_windows:
+            pulse_window = new_windows[0]
+            break
+        elif all_windows and not pre_existing_hwnds:
+            # Fallback: if no pre-existing info was provided, use any window found
+            pulse_window = all_windows[0]
             break
     
     if not pulse_window:
-        log_yaz("HATA: Pulse Secure token penceresi bulunamadı.")
+        if pre_existing_hwnds and len(get_vpn_windows()) > 0:
+            log_yaz("Mevcut VPN penceresi kullanıcı tarafından açılmış. Token girişi atlanıyor.")
+        else:
+            log_yaz("HATA: Pulse Secure token penceresi bulunamadı.")
         return False
     
     log_yaz("Token penceresi bulundu. Token giriliyor...")
@@ -540,6 +569,14 @@ def vpn_baglan():
     log_yaz(f"Otomatik bağlantı deneniyor... ({url} / {realm})")
     
     try:
+        # Record existing VPN windows BEFORE launching pulselauncher
+        # so we can distinguish user-opened windows from newly created ones
+        pre_existing_windows = get_vpn_windows()
+        pre_existing_hwnds = {w._hWnd for w in pre_existing_windows}
+        
+        if pre_existing_hwnds:
+            log_yaz(f"Mevcut VPN penceresi tespit edildi ({len(pre_existing_hwnds)} adet). Yeni pencere beklenecek.")
+        
         # Use SecureString to minimize password exposure in memory
         with SecureString(pwd) as secure_pwd:
             args = [
@@ -558,8 +595,12 @@ def vpn_baglan():
         # If TOTP secret is configured, try to auto-enter token
         if monitor_state.get("totp_secret"):
             # Run token entry in a separate thread to not block
+            # Pass pre-existing window handles so the thread only interacts with NEW windows
             import threading
-            token_thread = threading.Thread(target=enter_token_in_pulse_window)
+            token_thread = threading.Thread(
+                target=enter_token_in_pulse_window,
+                args=(pre_existing_hwnds,)
+            )
             token_thread.daemon = True
             token_thread.start()
         
@@ -687,13 +728,18 @@ def monitor_loop():
                     else:
                         now = time.time()
                         if now - last_connection_attempt > COOLDOWN_SECONDS:
-                            log_yaz(f"VPN Koptu. Otomatik bağlanılıyor... (Deneme {retry_count + 1}/{max_retries})")
-                            if vpn_baglan():
-                                last_connection_attempt = now
-                                monitor_state["auto_retry_count"] = retry_count + 1
+                            # Check if user already has VPN window open (manual connection attempt)
+                            if is_vpn_window_open():
+                                log_yaz("VPN penceresi zaten açık. Kullanıcı manuel bağlantı yapıyor olabilir, otomatik bağlantı atlanıyor.")
+                                last_connection_attempt = now  # Reset cooldown to avoid spamming this check
                             else:
-                                last_connection_attempt = now + 60 # Retry sooner if launch failed
-                                monitor_state["auto_retry_count"] = retry_count + 1
+                                log_yaz(f"VPN Koptu. Otomatik bağlanılıyor... (Deneme {retry_count + 1}/{max_retries})")
+                                if vpn_baglan():
+                                    last_connection_attempt = now
+                                    monitor_state["auto_retry_count"] = retry_count + 1
+                                else:
+                                    last_connection_attempt = now + 60 # Retry sooner if launch failed
+                                    monitor_state["auto_retry_count"] = retry_count + 1
                         else:
                             # In cooldown - log remaining time
                             remaining = int(COOLDOWN_SECONDS - (now - last_connection_attempt))
