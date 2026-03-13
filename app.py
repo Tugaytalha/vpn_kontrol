@@ -653,9 +653,17 @@ def monitor_loop():
     
     # Track current day to detect date changes
     current_day_str = datetime.now().strftime("%Y-%m-%d")
-    
+
+    # Wall-clock reference for accurate elapsed-time accounting
+    loop_start_time = time.time()
+
     while not _shutdown_flag.is_set():
         try:
+            # Measure actual time since last iteration (immune to VPN-check overhead)
+            now_time = time.time()
+            actual_elapsed = now_time - loop_start_time
+            loop_start_time = now_time
+
             # Check if day changed
             now_day_str = datetime.now().strftime("%Y-%m-%d")
             if now_day_str != current_day_str:
@@ -758,12 +766,11 @@ def monitor_loop():
                 last_connection_attempt = 0 # Reset cooldown on success
                 monitor_state["auto_retry_count"] = 0  # Reset retry counter on successful connection
                 
-                # Stats update
+                # Stats update — use real elapsed seconds, not the nominal check_interval,
+                # so overhead from the VPN check call doesn't cause undercounting.
                 now = datetime.now()
-                # Stats update
-                now = datetime.now()
-                monitor_state["hourly_stats"][now.hour] = monitor_state["hourly_stats"].get(now.hour, 0) + monitor_state["check_interval"]
-                monitor_state["real_vpn_seconds"] += monitor_state["check_interval"]
+                monitor_state["hourly_stats"][now.hour] = monitor_state["hourly_stats"].get(now.hour, 0) + actual_elapsed
+                monitor_state["real_vpn_seconds"] += actual_elapsed
                 
                 # Update effective total based on location
                 if monitor_state["location"] == "office":
